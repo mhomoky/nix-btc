@@ -1,0 +1,9 @@
+# 1. Create a writable nix.conf somewhere (e.g., in /tmp)
+mkdir -p /tmp/etc-nix
+echo "experimental-features = nix-command flakes" > /tmp/etc-nix/nix.conf
+
+# 2. Ensure the target directory exists
+sudo mkdir -p /etc/nix
+
+# 3. Bind mount your custom nix.conf over the system one
+sudo mount --bind /tmp/etc-nix/nix.conf /etc/nix/nix.conf
