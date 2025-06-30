@@ -125,20 +125,12 @@ get_root_device() {
 list_disks() {
   local mode="$1"
   local rootdev="$2"
+  # Less restrictive: show all USB/NVMe disks not currently mounted as root
   if [ "$mode" = "safe" ]; then
     jq_filter='
       .blockdevices[]
       | select((.tran == "usb" or .tran == "nvme") and .type == "disk")
       | select(.path != $rootdev)
-      | select(
-          (.mountpoints | all(. == null or . == "")) and
-          ((.children == null) or
-            (.children | all(
-              (.mountpoints | all(. == null or . == "")) and
-              (.fstype == null or .fstype == "")
-            ))
-          )
-        )
       | {model: .model, size: .size, path: .path, id: (."id-link" // .path)}
     '
   else
@@ -165,16 +157,22 @@ select_disk() {
     id=$(echo "$line" | jq -r .id)
     menu_items+=("$id" "$model $size")
   done <<< "$(echo "$disks" | jq -c '.')"
+  if [ "${#menu_items[@]}" -eq 0 ]; then
+    dialog --msgbox "No suitable disks found in $mode mode. Try advanced mode or check your hardware." 8 60
+    exit 1
+  fi
   dialog --menu "Select target disk ($mode mode):" 20 70 10 "${menu_items[@]}" 2>&1 1>&3
 }
 
-# 6. Dual-boot partitioning demo (installer + NixOS)
-cat > /tmp/disko-var.nix <<'EOF'
+# 6. Write disko.nix using selected disk
+write_disko_nix() {
+  local disk_path="$1"
+  cat > /tmp/disko.nix <<EOF
 {
   disko.devices = {
     disk = {
       mydisk = {
-        device = builtins.getEnv "CHOSEN_DISK"; # Uses env.var to pass CHOSEN_DISK to disko
+        device = "${disk_path}";
         type = "disk";
         content = {
           type = "gpt";
@@ -200,6 +198,9 @@ cat > /tmp/disko-var.nix <<'EOF'
   };
 }
 EOF
+  echo "$disk_path" > /tmp/selected-disk
+  export CHOSEN_DISK="$disk_path"
+}
 
 # Main workflow
 setup_nix_conf
@@ -222,6 +223,15 @@ else
 fi
 exec 3>&-
 
-dialog --msgbox "You selected: $CHOSEN_DISK" 8 40
+write_disko_nix "$CHOSEN_DISK"
 
-export $CHOSEN_DISK
+dialog --msgbox "You selected: $CHOSEN_DISK
+
+Disko config written to /tmp/disko.nix
+Disk path written to /tmp/selected-disk
+Exported as \$CHOSEN_DISK for this shell." 10 60
+
+echo -e "${BOLD}For dual-boot partitioning, see /tmp/disko.nix${RESET}"
+echo -e "${BOLD}Selected disk: $CHOSEN_DISK${RESET}"
+
+# End of script
