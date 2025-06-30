@@ -9,16 +9,9 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, nix-bitcoin, disko, sops-nix, flake-utils, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          config.allowUnfree = true;
-        };
-      in {
+  outputs = { self, nixpkgs, nix-bitcoin, disko, sops-nix, flake-utils, ... }@inputs: {
         nixosConfigurations = {
-          nixbitcoin-portable = pkgs.lib.nixosSystem {
+          nixbitcoin-portable = nixpkgs.lib.nixosSystem {
             system = "x86_64-linux";
             modules = [
               ./configuration.nix
@@ -28,5 +21,5 @@
             ];
           };
         };
-      });
+      };
 }
