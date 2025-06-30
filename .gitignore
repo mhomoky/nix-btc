@@ -1,0 +1,6 @@
+# .gitignore
+secrets/age.key
+result
+result-*
+*.swp
+*.swo
