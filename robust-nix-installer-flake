@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+
+# Notes:
+
+# Designed to be pulled down from GitHub after booting
+# e.g. NixOS 25.05 minimal ISO installer from a USB key / disk
+
+# Advanced NixOS installer for minimal ISO, with modern Nix (flakes) support.
+# - Ensures modern Nix commands (flakes) are available and persistent via bind-mount
+# - Handles network setup (wired/wifi, DHCP/manual, IPv4/IPv6) without nmcli
+# - Installs required tools (jq, dialog, git, networkmanager, etc.) using flakes
+# - Presents menu-driven disk selection (safe/advanced)
+# - Demonstrates dual-boot partitioning (installer + NixOS)
+# - Uses Quad9 DNS (IPv4 and IPv6)
+
+set -euo pipefail
+
+# Color definitions
+if tput setaf 1 &>/dev/null; then
+  RED=$(tput setaf 1)
+  GREEN=$(tput setaf 2)
+  YELLOW=$(tput setaf 3)
+  BLUE=$(tput setaf 4)
+  BOLD=$(tput bold)
+  RESET=$(tput sgr0)
+else
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; RESET=""
+fi
+
+# 1. Bind-mount modern nix.conf for flakes support
+setup_nix_conf() {
+  mkdir -p /tmp/etc-nix
+  echo "experimental-features = nix-command flakes" > /tmp/etc-nix/nix.conf
+  mkdir -p /etc/nix
+  if ! mountpoint -q /etc/nix/nix.conf; then
+    [ -f /etc/nix/nix.conf ] && mv /etc/nix/nix.conf /etc/nix/nix.conf.bak.$(date +%s)
+    mount --bind /tmp/etc-nix/nix.conf /etc/nix/nix.conf
+  fi
+  export NIX_CONFIG="experimental-features = nix-command flakes"
+}
+
+# 2. Check for network connectivity (IPv4 and IPv6)
+check_network() {
+  ping -c1 -W1 9.9.9.9 >/dev/null 2>&1 && return 0
+  ping6 -c1 -W1 2620:fe::fe >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# 3. Interactive network setup (wired/wifi, DHCP/manual, IPv4/IPv6)
+network_setup() {
+  echo -e "${YELLOW}${BOLD}No network detected. Starting interactive network setup...${RESET}"
+
+  # List interfaces
+  interfaces=($(ip -o link show | awk -F': ' '{print $2}' | grep -v lo))
+  echo -e "${BLUE}Available interfaces:${RESET}"
+  select IFACE in "${interfaces[@]}"; do
+    [ -n "$IFACE" ] && break
+  done
+
+  # Wired or WiFi?
+  if iw dev "$IFACE" info >/dev/null 2>&1; then
+    echo -e "${BLUE}WiFi interface detected.${RESET}"
+    read -rp "$(echo -e "${BOLD}Enter SSID:${RESET} ")" SSID
+    read -rsp "$(echo -e "${BOLD}Enter WiFi password:${RESET} ")" PSK; echo
+    cat > /tmp/wpa_supplicant.conf <<EOF
+network={
+  ssid="$SSID"
+  psk="$PSK"
+}
+EOF
+    wpa_supplicant -B -i "$IFACE" -c /tmp/wpa_supplicant.conf
+    sleep 3
+  else
+    echo -e "${BLUE}Wired interface detected.${RESET}"
+  fi
+
+  # DHCP or manual?
+  PS3="$(echo -e "${BOLD}Choose IP assignment method:${RESET} ")"
+  select IPMODE in "DHCP" "Manual"; do
+    [ -n "$IPMODE" ] && break
+  done
+
+  if [ "$IPMODE" = "DHCP" ]; then
+    dhclient "$IFACE" || udhcpc -i "$IFACE"
+  else
+    read -rp "$(echo -e "${BOLD}IPv4 address (leave blank to skip):${RESET} ")" IPV4
+    if [ -n "$IPV4" ]; then
+      read -rp "$(echo -e "${BOLD}Netmask (e.g. 24):${RESET} ")" NETMASK
+      read -rp "$(echo -e "${BOLD}Gateway:${RESET} ")" GW
+      ip addr add "$IPV4"/"$NETMASK" dev "$IFACE"
+      ip route add default via "$GW"
+    fi
+    read -rp "$(echo -e "${BOLD}IPv6 address (leave blank to skip):${RESET} ")" IPV6
+    if [ -n "$IPV6" ]; then
+      read -rp "$(echo -e "${BOLD}Prefixlen (e.g. 64):${RESET} ")" PREFIX
+      read -rp "$(echo -e "${BOLD}Gateway:${RESET} ")" GW6
+      ip -6 addr add "$IPV6"/"$PREFIX" dev "$IFACE"
+      ip -6 route add default via "$GW6"
+    fi
+  fi
+
+  # Use Quad9 DNS (IPv4 and IPv6)
+  echo -e "nameserver 9.9.9.9\nnameserver 149.112.112.112\nnameserver 2620:fe::fe\nnameserver 2620:fe::9" > /etc/resolv.conf
+
+  sleep 2
+  if check_network; then
+    echo -e "${GREEN}${BOLD}Network setup successful.${RESET}"
+  else
+    echo -e "${RED}${BOLD}Network setup failed. Please retry.${RESET}"
+    exit 1
+  fi
+}
+
+# 4. Install required tools using modern Nix (flakes)
+install_tools() {
+  echo -e "${YELLOW}Ensuring required tools are installed using flakes...${RESET}"
+  nix profile install nixpkgs#jq nixpkgs#dialog nixpkgs#git nixpkgs#networkmanager
+}
+
+# 5. Menu-driven disk selection (safe/advanced)
+get_root_device() {
+  findmnt -n -o SOURCE / | sed 's/[0-9]*$//'
+}
+
+list_disks() {
+  local mode="$1"
+  local rootdev="$2"
+  if [ "$mode" = "safe" ]; then
+    jq_filter='
+      .blockdevices[]
+      | select((.tran == "usb" or .tran == "nvme") and .type == "disk")
+      | select(.path != $rootdev)
+      | select(
+          (.mountpoints | all(. == null or . == "")) and
+          ((.children == null) or
+            (.children | all(
+              (.mountpoints | all(. == null or . == "")) and
+              (.fstype == null or .fstype == "")
+            ))
+          )
+        )
+      | {model: .model, size: .size, path: .path, id: (."id-link" // .path)}
+    '
+  else
+    jq_filter='
+      .blockdevices[]
+      | select((.tran == "usb" or .tran == "nvme") and .type == "disk")
+      | select(.path != $rootdev)
+      | {model: .model, size: .size, path: .path, id: (."id-link" // .path)}
+    '
+  fi
+  lsblk -J -o NAME,MODEL,SIZE,PATH,ID-LINK,TRAN,TYPE,MOUNTPOINTS,FSTYPE | \
+    jq -r --arg rootdev "$rootdev" "$jq_filter"
+}
+
+select_disk() {
+  local mode="$1"
+  local rootdev="$2"
+  local disks
+  disks=$(list_disks "$mode" "$rootdev")
+  local menu_items=()
+  while read -r line; do
+    model=$(echo "$line" | jq -r .model)
+    size=$(echo "$line" | jq -r .size)
+    id=$(echo "$line" | jq -r .id)
+    menu_items+=("$id" "$model $size")
+  done <<< "$(echo "$disks" | jq -c '.')"
+  dialog --menu "Select target disk ($mode mode):" 20 70 10 "${menu_items[@]}" 2>&1 1>&3
+}
+
+# 6. Dual-boot partitioning demo (installer + NixOS)
+cat > /tmp/disko-dualboot-demo.nix <<'EOF'
+{
+  disko.devices = {
+    disk = {
+      mydisk = {
+        device = "/dev/disk/by-id/usb-YourDeviceID"; # Replace with selected disk
+        type = "disk";
+        content = {
+          type = "gpt";
+          partitions = [
+            # Existing installer partition (do not touch)
+            { name = "installer"; start = "1MiB"; end = "4096MiB"; type = "0700"; }
+            # ESP for new NixOS
+            { name = "ESP"; start = "4096MiB"; end = "5120MiB"; type = "EF00";
+              content = { type = "filesystem"; format = "vfat"; mountpoint = "/boot"; mountOptions = [ "umask=0077" ]; };
+            }
+            # Root for new NixOS
+            { name = "root"; start = "5120MiB"; end = "-8GiB"; type = "8300";
+              content = { type = "filesystem"; format = "ext4"; mountpoint = "/"; };
+            }
+            # Swap for new NixOS
+            { name = "swap"; start = "-8GiB"; end = "100%"; type = "8200";
+              content = { type = "swap"; };
+            }
+          ];
+        };
+      };
+    };
+  };
+}
+EOF
+
+# Main workflow
+setup_nix_conf
+
+if check_network; then
+  echo -e "${GREEN}${BOLD}Network detected.${RESET}"
+else
+  network_setup
+fi
+
+install_tools
+
+ROOT_DEV=$(get_root_device)
+exec 3>&1
+MODE=$(dialog --menu "Choose mode:" 10 40 2 1 "Safe (recommended)" 2 "Advanced (show all disks)" 2>&1 1>&3)
+if [[ "$MODE" == "1" ]]; then
+  CHOSEN_DISK=$(select_disk "safe" "$ROOT_DEV")
+else
+  CHOSEN_DISK=$(select_disk "advanced" "$ROOT_DEV")
+fi
+exec 3>&-
+
+dialog --msgbox "You selected: $CHOSEN_DISK" 8 40
+
+echo -e "${BOLD}For dual-boot partitioning, see /tmp/disko-dualboot-demo.nix${RESET}"
+echo -e "${BOLD}Replace the device path in that file with: $CHOSEN_DISK${RESET}"
+
+# End of script
