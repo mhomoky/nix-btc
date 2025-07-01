@@ -2,7 +2,7 @@
 
 {
   imports = [
-    ./disko-var.nix
+    ./disko.nix
   ];
 
   networking.hostName = "nixbitcoin-portable";
