@@ -49,7 +49,7 @@
     enable = true;
     bitcoin = {
       enable = true;
-      package = pkgs.bitcoinKnots;
+      package = pkgs.bitcoind-knots;
       extraConfig = ''
         txindex=1
         server=1
